@@ -2450,12 +2450,6 @@ function setopts (self, pattern, options) {
     pattern = "**/" + pattern
   }
 
-  self.windowsPathsNoEscape = !!options.windowsPathsNoEscape ||
-    options.allowWindowsEscape === false
-  if (self.windowsPathsNoEscape) {
-    pattern = pattern.replace(/\\/g, '/')
-  }
-
   self.silent = !!options.silent
   self.pattern = pattern
   self.strict = options.strict !== false
@@ -2511,6 +2505,8 @@ function setopts (self, pattern, options) {
   // Note that they are not supported in Glob itself anyway.
   options.nonegate = true
   options.nocomment = true
+  // always treat \ in patterns as escapes, not path separators
+  options.allowWindowsEscape = true
 
   self.minimatch = new Minimatch(pattern, options)
   self.options = self.minimatch.options
@@ -7843,6 +7839,7 @@ const PHPCodeSniffer = __nccwpck_require__(5405);
 const Prettier = __nccwpck_require__(3460);
 const Pylint = __nccwpck_require__(4963);
 const RuboCop = __nccwpck_require__(1399);
+const RustFmt = __nccwpck_require__(3421);
 const Stylelint = __nccwpck_require__(194);
 const SwiftFormatLockwood = __nccwpck_require__(8983);
 const SwiftFormatOfficial = __nccwpck_require__(1828);
@@ -7873,6 +7870,7 @@ const linters = {
 	dotnet_format: DotnetFormat,
 	gofmt: Gofmt,
 	oitnb: Oitnb,
+	rustfmt: RustFmt,
 	prettier: Prettier,
 	swift_format_lockwood: SwiftFormatLockwood,
 	swift_format_official: SwiftFormatOfficial,
@@ -8491,6 +8489,95 @@ class RuboCop {
 }
 
 module.exports = RuboCop;
+
+
+/***/ }),
+
+/***/ 3421:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+const { run } = __nccwpck_require__(9575);
+const commandExists = __nccwpck_require__(5265);
+const { initLintResult } = __nccwpck_require__(9149);
+
+/** @typedef {import('../utils/lint-result').LintResult} LintResult */
+
+const PARSE_REGEX = /([\s\S]*?) at line (\d*):$([\s\S]*)/m;
+
+/**
+ * https://github.com/rust-lang/rustfmt
+ */
+class RustFmt {
+	static get name() {
+		return "rustfmt";
+	}
+
+	/**
+	 * Verifies that all required programs are installed. Throws an error if programs are missing
+	 * @param {string} dir - Directory to run the linting program in
+	 * @param {string} prefix - Prefix to the lint command
+	 */
+	static async verifySetup(dir, prefix = "") {
+		// Verify that cargo format is installed
+		if (!(await commandExists("cargo-fmt"))) {
+			throw new Error("Cargo format is not installed");
+		}
+	}
+
+	/**
+	 * Runs the linting program and returns the command output
+	 * @param {string} dir - Directory to run the linter in
+	 * @param {string[]} extensions - File extensions which should be linted
+	 * @param {string} args - Additional arguments to pass to the linter
+	 * @param {boolean} fix - Whether the linter should attempt to fix code style issues automatically
+	 * @param {string} prefix - Prefix to the lint command
+	 * @returns {{status: number, stdout: string, stderr: string}} - Output of the lint command
+	 */
+	static lint(dir, extensions, args = "", fix = false, prefix = "") {
+		if (extensions.length !== 1 || extensions[0] !== "rs") {
+			throw new Error(`${this.name} error: File extensions are not configurable`);
+		}
+		const fixArg = fix ? "" : "--check";
+		return run(`${prefix} cargo fmt ${fixArg} ${args}`, {
+			dir,
+			ignoreErrors: true,
+		});
+	}
+
+	/**
+	 * Parses the output of the lint command. Determines the success of the lint process and the
+	 * severity of the identified code style violations
+	 * @param {string} dir - Directory in which the linter has been run
+	 * @param {{status: number, stdout: string, stderr: string}} output - Output of the lint command
+	 * @returns {LintResult} - Parsed lint result
+	 */
+	static parseOutput(dir, output) {
+		const lintResult = initLintResult();
+		lintResult.isSuccess = output.status === 0;
+		if (!output.stdout) {
+			return lintResult;
+		}
+
+		const diffs = output.stdout.split(/^Diff in /gm).slice(1);
+		for (const diff of diffs) {
+			const [_, pathFull, line, message] = diff.match(PARSE_REGEX);
+			// Split on dir works for windows UNC paths, the substring strips out the
+			// left over '/' or '\\'
+			const path = pathFull.split(dir)[1].substring(1);
+			const lineNr = parseInt(line, 10);
+			lintResult.error.push({
+				path,
+				firstLine: lineNr,
+				lastLine: lineNr,
+				message,
+			});
+		}
+
+		return lintResult;
+	}
+}
+
+module.exports = RustFmt;
 
 
 /***/ }),
@@ -9468,7 +9555,6 @@ var os = __nccwpck_require__(2037);
 var process = __nccwpck_require__(7282);
 var fs = __nccwpck_require__(7147);
 var path = __nccwpck_require__(1017);
-var util = __nccwpck_require__(3837);
 var which = __nccwpck_require__(4207);
 
 function _interopNamespaceDefault(e) {
@@ -9755,14 +9841,6 @@ function quoteShellArg(
 const binBash = "bash";
 
 /**
- * The name of the C shell (csh) binary.
- *
- * @constant
- * @type {string}
- */
-const binCsh = "csh";
-
-/**
  * The name of the Debian Almquist shell (Dash) binary.
  *
  * @constant
@@ -9788,14 +9866,12 @@ const binZsh = "zsh";
  * @returns {string} The escaped argument.
  */
 function escapeArgBash(arg, { interpolation, quoted }) {
-  let result = arg
-    .replace(/[\0\u0008\u001B\u009B]/gu, "")
-    .replace(/\r(?!\n)/gu, "");
+  let result = arg.replace(/[\0\u0008\u001B\u009B]/gu, "");
 
   if (interpolation) {
     result = result
       .replace(/\\/gu, "\\\\")
-      .replace(/\r?\n/gu, " ")
+      .replace(/\n/gu, " ")
       .replace(/(^|\s)([#~])/gu, "$1\\$2")
       .replace(/(["$&'()*;<>?`{|])/gu, "\\$1")
       .replace(/(?<=[:=])(~)(?=[\s+\-/0:=]|$)/gu, "\\$1")
@@ -9804,50 +9880,7 @@ function escapeArgBash(arg, { interpolation, quoted }) {
     result = result.replace(/'/gu, `'\\''`);
   }
 
-  return result;
-}
-
-/**
- * Escapes a shell argument for use in csh.
- *
- * @param {string} arg The argument to escape.
- * @param {object} options The escape options.
- * @param {boolean} options.interpolation Is interpolation enabled.
- * @param {boolean} options.quoted Is `arg` being quoted.
- * @returns {string} The escaped argument.
- */
-function escapeArgCsh(arg, { interpolation, quoted }) {
-  let result = arg
-    .replace(/[\0\u0008\u001B\u009B]/gu, "")
-    .replace(/\r?\n|\r/gu, " ");
-
-  if (interpolation) {
-    result = result
-      .replace(/\\/gu, "\\\\")
-      .replace(/(^|\s)(~)/gu, "$1\\$2")
-      .replace(/(["#$&'()*;<>?[`{|])/gu, "\\$1")
-      .replace(/([\t ])/gu, "\\$1");
-
-    const textEncoder = new util.TextEncoder();
-    result = result
-      .split("")
-      .map(
-        // Due to a bug in C shell version 20110502-7, when a character whose
-        // utf-8 encoding includes the bytes 0xA0 (160 in decimal) appears in
-        // an argument after an escaped character, it will hang and endlessly
-        // consume memory unless the character is escaped with quotes.
-        // ref: https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=995013
-        (char) => (textEncoder.encode(char).includes(160) ? `'${char}'` : char)
-      )
-      .join("");
-  } else {
-    result = result.replace(/\\!$/gu, "\\\\!");
-    if (quoted) {
-      result = result.replace(/'/gu, `'\\''`);
-    }
-  }
-
-  result = result.replace(/!(?!$)/gu, "\\!");
+  result = result.replace(/\r(?!\n)/gu, "");
 
   return result;
 }
@@ -9862,20 +9895,20 @@ function escapeArgCsh(arg, { interpolation, quoted }) {
  * @returns {string} The escaped argument.
  */
 function escapeArgDash(arg, { interpolation, quoted }) {
-  let result = arg
-    .replace(/[\0\u0008\u001B\u009B]/gu, "")
-    .replace(/\r(?!\n)/gu, "");
+  let result = arg.replace(/[\0\u0008\u001B\u009B]/gu, "");
 
   if (interpolation) {
     result = result
       .replace(/\\/gu, "\\\\")
-      .replace(/\r?\n/gu, " ")
+      .replace(/\n/gu, " ")
       .replace(/(^|\s)([#~])/gu, "$1\\$2")
       .replace(/(["$&'()*;<>?`|])/gu, "\\$1")
       .replace(/([\t\n ])/gu, "\\$1");
   } else if (quoted) {
     result = result.replace(/'/gu, `'\\''`);
   }
+
+  result = result.replace(/\r(?!\n)/gu, "");
 
   return result;
 }
@@ -9890,20 +9923,20 @@ function escapeArgDash(arg, { interpolation, quoted }) {
  * @returns {string} The escaped argument.
  */
 function escapeArgZsh(arg, { interpolation, quoted }) {
-  let result = arg
-    .replace(/[\0\u0008\u001B\u009B]/gu, "")
-    .replace(/\r(?!\n)/gu, "");
+  let result = arg.replace(/[\0\u0008\u001B\u009B]/gu, "");
 
   if (interpolation) {
     result = result
       .replace(/\\/gu, "\\\\")
-      .replace(/\r?\n/gu, " ")
+      .replace(/\n/gu, " ")
       .replace(/(^|\s)([#=~])/gu, "$1\\$2")
       .replace(/(["$&'()*;<>?[\]`{|}])/gu, "\\$1")
       .replace(/([\t ])/gu, "\\$1");
   } else if (quoted) {
     result = result.replace(/'/gu, `'\\''`);
   }
+
+  result = result.replace(/\r(?!\n)/gu, "");
 
   return result;
 }
@@ -9950,8 +9983,6 @@ function getEscapeFunction$1(shellName) {
   switch (shellName) {
     case binBash:
       return escapeArgBash;
-    case binCsh:
-      return escapeArgCsh;
     case binDash:
       return escapeArgDash;
     case binZsh:
@@ -9970,7 +10001,6 @@ function getEscapeFunction$1(shellName) {
 function getQuoteFunction$1(shellName) {
   switch (shellName) {
     case binBash:
-    case binCsh:
     case binDash:
     case binZsh:
       return quoteArg$1;
@@ -10072,7 +10102,7 @@ function escapeArgPowerShell(arg, { interpolation, quoted }) {
 
   if (interpolation) {
     result = result
-      .replace(/\r?\n/gu, " ")
+      .replace(/\r?\n|\r/gu, " ")
       .replace(/(^|[\s\u0085])([*1-6]?)(>)/gu, "$1$2`$3")
       .replace(/(^|[\s\u0085])([#\-:<@\]])/gu, "$1`$2")
       .replace(/(["&'(),;{|}‘’‚‛“”„])/gu, "`$1")
@@ -10246,12 +10276,12 @@ function getHelpersByPlatform({ env, platform }) {
 }
 
 /**
- * A simple shell escape library. Use it to escape user-controlled inputs to
+ * A simple shell escape package. Use it to escape user-controlled inputs to
  * shell commands to prevent shell injection.
  *
- * @overview Entrypoint for the library.
+ * @overview Entrypoint for the package.
  * @module shescape
- * @version 1.6.4
+ * @version 1.6.2
  * @license MPL-2.0
  */
 
